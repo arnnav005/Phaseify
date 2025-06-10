@@ -4,7 +4,7 @@ from flask import Flask, redirect, request, session, jsonify, url_for, render_te
 from dotenv import load_dotenv
 from urllib.parse import urlencode
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 import time
@@ -43,6 +43,17 @@ def _get_all_pages(url, access_token):
         next_url = data.get('next')
         endpoint = next_url.replace(API_BASE_URL, '') if next_url else None
     return items
+
+def _get_artist_genres(artist_ids, access_token):
+    genres_map = {}
+    for i in range(0, len(artist_ids), 50):
+        chunk = artist_ids[i:i+50]
+        params = {'ids': ','.join(chunk)}
+        data = _get_api_data('artists', access_token, params=params)
+        for artist in data.get('artists', []):
+            if artist:
+                genres_map[artist['id']] = artist.get('genres', [])
+    return genres_map
 
 def _get_season_key(dt):
     month = dt.month
@@ -131,62 +142,111 @@ def timeline():
     if not access_token: return redirect('/login')
 
     try:
-        logging.info("Performing full analysis...")
+        logging.info("Performing analysis for the last 3 years...")
         
-        saved_tracks_items = _get_all_pages('me/tracks?limit=50', access_token)
+        # --- NEW: Filter saved tracks to the last 3 years ---
+        all_saved_tracks = _get_all_pages('me/tracks?limit=50', access_token)
+        three_years_ago = datetime.now() - timedelta(days=3*365)
         
-        all_tracks_info = {}
-        for item in saved_tracks_items:
+        recent_saved_tracks = []
+        for item in all_saved_tracks:
+            if item.get('added_at'):
+                added_date = datetime.fromisoformat(item['added_at'].replace('Z', ''))
+                if added_date > three_years_ago:
+                    recent_saved_tracks.append(item)
+        logging.info(f"Found {len(recent_saved_tracks)} tracks saved in the last 3 years.")
+        
+        top_tracks = {
+            'long_term': _get_api_data('me/top/tracks', access_token, {'limit': 50, 'time_range': 'long_term'})['items'],
+            'medium_term': _get_api_data('me/top/tracks', access_token, {'limit': 50, 'time_range': 'medium_term'})['items'],
+            'short_term': _get_api_data('me/top/tracks', access_token, {'limit': 50, 'time_range': 'short_term'})['items']
+        }
+        
+        relevance_scores = defaultdict(int)
+        for item in recent_saved_tracks:
+            if item.get('track'): relevance_scores[item['track']['id']] += 1
+        for t in top_tracks['long_term']: relevance_scores[t['id']] += 2
+        for t in top_tracks['medium_term']: relevance_scores[t['id']] += 5
+        for t in top_tracks['short_term']: relevance_scores[t['id']] += 10
+        
+        all_tracks_info, all_artist_ids = {}, set()
+        all_track_items = recent_saved_tracks + [{'track': t, 'added_at': None} for t_list in top_tracks.values() for t in t_list]
+
+        for item in all_track_items:
             track = item.get('track')
-            if not track or not track.get('id'): continue
+            if not track or not track.get('id') or track['id'] in all_tracks_info: continue
+            artist = track.get('artists', [{}])[0]
             album = track.get('album', {})
             images = album.get('images', [])
-            all_tracks_info[track['id']] = {'name': track.get('name', 'N/A'), 'artist_name': track['artists'][0]['name'] if track.get('artists') else 'N/A', 'popularity': track.get('popularity', 0), 'release_year': int(album.get('release_date', '0').split('-')[0]), 'added_at': item.get('added_at'), 'cover_url': images[0]['url'] if images else 'https://placehold.co/128x128/121212/FFFFFF?text=?'}
+            cover_url = images[0]['url'] if images else 'https://placehold.co/128x128/121212/FFFFFF?text=?'
+            all_tracks_info[track['id']] = {'name': track.get('name', 'N/A'), 'artist_id': artist.get('id'), 'album_id': album.get('id'), 'artist_name': artist.get('name', 'N/A'), 'popularity': track.get('popularity', 0), 'release_year': int(album.get('release_date', '0').split('-')[0]), 'added_at': item.get('added_at'), 'relevance_score': relevance_scores.get(track['id'], 0), 'cover_url': cover_url}
+            if artist.get('id'): all_artist_ids.add(artist.get('id'))
 
-        phases = defaultdict(list)
-        for track_id, info in all_tracks_info.items():
-            if not info.get('added_at'): continue
-            dt = datetime.fromisoformat(info['added_at'].replace('Z', ''))
-            key = _get_season_key(dt)
-            if key: phases[key].append(info)
+        artist_genres_map = _get_artist_genres(list(all_artist_ids), access_token)
+
+        phases = defaultdict(lambda: {'track_infos': [], 'genres': defaultdict(int)})
+        for track_id, track_info in all_tracks_info.items():
+            if not track_info.get('added_at'): continue
+            dt = datetime.fromisoformat(track_info['added_at'].replace('Z', ''))
+            phase_key = _get_season_key(dt)
+            if phase_key:
+                phases[phase_key]['track_infos'].append(track_info)
+                if track_info.get('artist_id') in artist_genres_map:
+                    for genre in artist_genres_map[track_info['artist_id']]:
+                        phases[phase_key]['genres'][genre] += 1
+        
+        final_phases_output = []
+        used_album_ids = set()
         
         def get_sort_key(phase_key):
             season, year_str = phase_key.split(" ")
             return int(year_str), ["Winter", "Spring", "Summer", "Autumn"].index(season)
-        
-        final_phases_output = []
-        for key in sorted(phases.keys(), key=get_sort_key, reverse=True):
-            phase_tracks = phases[key]
-            if not phase_tracks: continue
+        sorted_phases = sorted(phases.items(), key=lambda item: get_sort_key(item[0]))
 
-            top_artists = list(dict.fromkeys([t['artist_name'] for t in phase_tracks]))[:5]
+        for key, data in sorted_phases:
+            if not data['track_infos']: continue
+            album_stats = defaultdict(lambda: {'count': 0, 'relevance': 0, 'cover': ''})
+            for track in data['track_infos']:
+                if track.get('album_id'):
+                    album_stats[track['album_id']]['count'] += 1
+                    album_stats[track['album_id']]['relevance'] += track['relevance_score']
+                    album_stats[track['album_id']]['cover'] = track['cover_url']
             
-            valid_years = [t['release_year'] for t in phase_tracks if t.get('release_year', 0) > 0]
-            avg_year = round(sum(valid_years) / len(valid_years)) if valid_years else 'N/A'
-            avg_pop = round(sum(t['popularity'] for t in phase_tracks) / len(phase_tracks)) if phase_tracks else 0
+            album_candidates = sorted([{'id': aid, **stats} for aid, stats in album_stats.items()], key=lambda x: (x['count'], x['relevance']), reverse=True)
+            cover_url = next((c['cover'] for c in album_candidates if c['id'] not in used_album_ids), 'https://placehold.co/128x128/121212/FFFFFF?text=?')
+            if cover_url != 'https://placehold.co/128x128/121212/FFFFFF?text=?': used_album_ids.add(next((c['id'] for c in album_candidates if c['cover'] == cover_url), None))
+
+            sorted_tracks = sorted(data['track_infos'], key=lambda t: t['relevance_score'], reverse=True)
+            top_artists = list(dict.fromkeys([t['artist_name'] for t in sorted_tracks]))[:5]
             
-            # This part can be expanded to fetch genres if needed
-            top_genres = ["Genre 1", "Genre 2"] # Placeholder
+            valid_year_tracks = [t['release_year'] for t in data['track_infos'] if t.get('release_year', 0) > 0]
+            avg_release_year = round(sum(valid_year_tracks) / len(valid_year_tracks)) if valid_year_tracks else 'N/A'
+            avg_popularity = round(sum(t['popularity'] for t in data['track_infos']) / len(data['track_infos'])) if data['track_infos'] else 0
             
-            phase_chars = {"period": key, "top_genres": top_genres, "avg_release_year": avg_year, "avg_popularity": avg_pop}
-            time.sleep(4) 
+            phase_chars = {"period": key, "top_genres": sorted(data['genres'], key=data['genres'].get, reverse=True)[:5], "avg_release_year": avg_release_year, "avg_popularity": avg_popularity}
+            # Reduced sleep time as the process is much faster now
+            time.sleep(2) 
             ai_details = _get_ai_phase_details(phase_chars, top_artists)
 
             final_phases_output.append({
                 'phase_period': key, 
                 'ai_phase_name': ai_details.get('phase_name', f"Your {key} Era"), 
-                'ai_phase_summary': ai_details.get('phase_summary', "A distinct period..."),
-                'track_count': len(phase_tracks),
-                'sample_tracks': [t['name'] for t in phase_tracks[:5]], 
-                'phase_cover_url': phase_tracks[0]['cover_url'] if phase_tracks else 'https://placehold.co/128x128/121212/FFFFFF?text=?'
+                'ai_phase_summary': ai_details.get('phase_summary', "A distinct period in your listening journey."),
+                'track_count': len(data['track_infos']), 
+                'top_genres': phase_chars['top_genres'],
+                'average_popularity': avg_popularity, 
+                'average_release_year': avg_release_year,
+                'sample_tracks': [t['name'] for t in sorted_tracks[:5]], 
+                'phase_cover_url': cover_url
             })
         
+        final_phases_output.reverse()
         display_name = session.get('display_name', 'friend')
         return render_template('timeline.html', phases=final_phases_output, display_name=display_name)
 
     except requests.exceptions.RequestException as e:
         logging.error(f"An error occurred during analysis: {e}")
-        return render_template('login.html', error="An error occurred. Your session might have expired. Please log in again.")
+        return render_template('login.html', error="An error occurred during analysis. Your session might have expired. Please log in again.")
 
 # --- Application Runner ---
 if __name__ == '__main__':
