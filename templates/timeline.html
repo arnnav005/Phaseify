@@ -14,17 +14,18 @@
         .timeline-item { opacity: 0; transform: translateY(20px); transition: opacity 0.6s ease-out, transform 0.6s ease-out; position: relative; padding-left: 60px; margin-bottom: 50px; }
         .timeline-item.is-visible { opacity: 1; transform: translateY(0); }
         .timeline-dot { position: absolute; top: 5px; left: 12px; width: 16px; height: 16px; border-radius: 50%; border: 3px solid #121212; background-color: #1DB954; z-index: 10; }
-        .skeleton { background-color: rgba(255, 255, 255, 0.1); border-radius: 0.25rem; }
-        .skeleton-text { height: 1em; }
-        .skeleton-title { height: 1.5em; width: 70%; }
-        .skeleton-para { height: 3em; }
+        .skeleton { background-color: rgba(255, 255, 255, 0.1); border-radius: 0.25rem; animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
     </style>
 </head>
 <body class="text-white">
 
     <header class="text-center py-12 px-4">
         <h1 class="text-5xl font-black tracking-tight">Your Music Discovery Timeline</h1>
-        <p class="text-zinc-400 text-lg mt-4">Hello, {{ display_name }}! This timeline visualizes the evolution of your taste based on the music you've saved.</p>
+        <p id="subtitle" class="text-zinc-400 text-lg mt-4">Hello, {{ display_name }}! Building your timeline now...</p>
     </header>
 
     <main class="container mx-auto px-4 py-8 max-w-3xl">
@@ -39,18 +40,20 @@
 
     <script>
         const container = document.getElementById('timeline-container');
+        const subtitle = document.getElementById('subtitle');
 
-        function createSkeletonCard() {
+        function createSkeletonCard(phase) {
             return `
-                <div class="timeline-item">
+                <div class="timeline-item is-visible">
                     <div class="timeline-dot"></div>
                     <div class="rounded-lg shadow-xl px-6 py-4 flex flex-col md:flex-row gap-6 items-start animate-pulse" style="background-color: #282828;">
                         <div class="flex-grow">
-                            <div class="skeleton skeleton-title mb-2"></div>
-                            <div class="skeleton skeleton-text mb-4 w-1/4"></div>
-                            <div class="skeleton skeleton-para mb-4"></div>
-                            <div class="flex flex-wrap gap-2 mt-2">
-                                <div class="skeleton h-5 w-20"></div> <div class="skeleton h-5 w-24"></div> <div class="skeleton h-5 w-16"></div>
+                            <div class="skeleton h-7 w-3/4 mb-2 rounded-md"></div>
+                            <p class="text-sm font-bold leading-snug tracking-wide uppercase mb-3 opacity-60">${phase.phase_period}</p>
+                            <div class="skeleton h-12 w-full mb-4 rounded-md"></div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-y-4 gap-x-6 mb-4">
+                                <div><p class="text-sm font-bold">Key Stats:</p><ul class="text-xs list-disc list-inside opacity-80"><li>${phase.track_count} songs saved</li></ul></div>
+                                <div><p class="text-sm font-bold">Some Relevant Tracks:</p><div class="skeleton h-16 w-full mt-1 rounded-md"></div></div>
                             </div>
                         </div>
                         <div class="flex-shrink-0 w-40 h-40 md:w-48 md:h-48 skeleton self-center rounded-2xl"></div>
@@ -62,120 +65,110 @@
         async function loadTimeline() {
             try {
                 const initialResponse = await fetch('/api/get_initial_phases');
+                if (!initialResponse.ok) throw new Error('Could not fetch your Spotify data. Your session may have expired.');
                 const initialPhases = await initialResponse.json();
 
-                if (!initialResponse.ok) throw new Error(initialPhases.error || 'Failed to fetch initial data.');
+                subtitle.innerText = `Hello, {{ display_name }}! Here is your journey through the music you've discovered.`;
 
-                // Render skeletons first
+                if (initialPhases.length === 0) {
+                    container.innerHTML = `<p class="text-center">Couldn't find any saved songs to analyze.</p>`;
+                    return;
+                }
+
+                // Render all skeletons first
                 initialPhases.forEach(phase => {
-                    const skeletonHTML = createSkeletonCard();
                     const div = document.createElement('div');
-                    div.innerHTML = skeletonHTML;
-                    div.firstChild.id = `phase-${phase.phase_period.replace(' ', '-')}`;
-                    container.appendChild(div.firstChild);
+                    div.id = `phase-${phase.phase_period.replace(' ', '-')}`;
+                    div.innerHTML = createSkeletonCard(phase);
+                    container.appendChild(div);
                 });
-
-                // Animate skeletons into view
-                const observer = new IntersectionObserver((entries) => {
-                    entries.forEach(entry => { if (entry.isIntersecting) entry.target.classList.add('is-visible'); });
-                }, { threshold: 0.1 });
-                document.querySelectorAll('.timeline-item').forEach(item => observer.observe(item));
 
                 // Now, fetch full details for each phase one by one
                 for (const phase of initialPhases) {
-                    const res = await fetch('/api/get_ai_details_for_phase', {
+                    const res = await fetch('/api/get_phase_details', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ period: phase.phase_period, tracks: phase.tracks }) // This part needs adjustment in backend
+                        body: JSON.stringify({ phase_key: phase.phase_period })
                     });
-                    const fullPhase = await res.json();
+                    if (!res.ok) {
+                        updateCardWithError(phase.phase_period);
+                        continue; // Move to the next phase
+                    }
+                    const fullPhaseData = await res.json();
                     
-                    updateCardWithData(phase, fullPhase);
+                    updateCardWithData(phase, fullPhaseData);
                 }
 
             } catch (error) {
-                container.innerHTML = `<p class="text-red-400 text-center">${error.message}</p>`;
+                subtitle.innerText = 'Something went wrong.';
+                container.innerHTML = `<p class="text-red-400 text-center">An error occurred during analysis. Please try logging out and back in. Details: ${error.message}</p>`;
             }
         }
 
-        function updateCardWithData(initialPhase, fullPhase) {
+        function updateCardWithError(phasePeriod) {
+            const cardId = `phase-${phasePeriod.replace(' ', '-')}`;
+            const cardElement = document.getElementById(cardId);
+            if (!cardElement) return;
+            cardElement.querySelector('.flex-grow').innerHTML = `<p class="text-red-300">Could not load details for ${phasePeriod}.</p>`;
+        }
+        
+        function updateCardWithData(initialPhase, fullPhaseData) {
             const cardId = `phase-${initialPhase.phase_period.replace(' ', '-')}`;
             const cardElement = document.getElementById(cardId);
             if (!cardElement) return;
 
-            const cardContent = `
+            cardElement.classList.remove('is-visible');
+            cardElement.innerHTML = `
                 <div class="timeline-dot"></div>
                 <div class="rounded-lg shadow-xl px-6 py-4 phase-card flex flex-col md:flex-row gap-6 items-start">
                     <div class="flex-grow">
-                        <h3 class="mb-1 font-black text-2xl">${fullPhase.ai_phase_name}</h3>
+                        <h3 class="mb-1 font-black text-2xl">${fullPhaseData.ai_phase_name}</h3>
                         <p class="text-sm font-bold leading-snug tracking-wide uppercase mb-3 opacity-60">${initialPhase.phase_period}</p>
-                        <p class="text-sm italic opacity-80 mb-4">${fullPhase.ai_phase_summary}</p>
+                        <p class="text-sm italic opacity-80 mb-4">${fullPhaseData.ai_phase_summary}</p>
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-y-4 gap-x-6 mb-4">
                             <div>
                                 <p class="text-sm font-bold">Key Stats:</p>
                                 <ul class="text-xs list-disc list-inside opacity-80">
                                     <li>${initialPhase.track_count} songs saved</li>
-                                    <li>Avg. Release Year: ${fullPhase.average_release_year}</li>
-                                    <li>Avg. Popularity: ${fullPhase.average_popularity}/100</li>
+                                    <li>Avg. Release Year: ${fullPhaseData.average_release_year}</li>
+                                    <li>Avg. Popularity: ${fullPhaseData.average_popularity}/100</li>
                                 </ul>
                             </div>
                             <div>
                                 <p class="text-sm font-bold">Some Relevant Tracks:</p>
                                 <ul class="text-xs list-disc list-inside opacity-80">
-                                    ${initialPhase.sample_tracks.map(t => `<li>${t}</li>`).join('')}
+                                    ${fullPhaseData.sample_tracks.map(t => `<li>${t}</li>`).join('')}
                                 </ul>
                             </div>
                         </div>
                         <div>
                             <p class="text-sm font-bold">Top Genres:</p>
                             <div class="flex flex-wrap gap-2 mt-2">
-                                ${fullPhase.top_genres.map(g => `<span class="text-xs font-semibold inline-block py-1 px-2 rounded-full last:mr-0 mr-1 bg-white/10">${g}</span>`).join('')}
+                                ${fullPhaseData.top_genres.map(g => `<span class="text-xs font-semibold inline-block py-1 px-2 rounded-full last:mr-0 mr-1 bg-white/10">${g}</span>`).join('')}
                             </div>
                         </div>
                     </div>
                     <div class="flex-shrink-0 w-40 h-40 md:w-48 md:h-48 mt-2 md:mt-0 self-center">
-                        <img src="${initialPhase.cover_url}" alt="Phase defining album cover" class="w-full h-full object-cover rounded-2xl shadow-lg">
+                        <img src="${fullPhaseData.phase_cover_url}" alt="Phase defining album cover" class="w-full h-full object-cover rounded-2xl shadow-lg">
                     </div>
                 </div>
             `;
-            cardElement.innerHTML = cardContent;
-            // Add random color to the new card
+            // Add random color and re-observe for animation
             const newCard = cardElement.querySelector('.phase-card');
             const bgColor = getRandomColor();
             newCard.style.backgroundColor = bgColor;
             newCard.style.color = getTextColor(bgColor);
             const genreTags = newCard.querySelectorAll('.bg-white\\/10');
             if (getTextColor(bgColor) === 'black') {
-                genreTags.forEach(tag => {
-                    tag.classList.remove('bg-white/10');
-                    tag.classList.add('bg-black/10');
-                });
+                genreTags.forEach(tag => { tag.classList.remove('bg-white/10'); tag.classList.add('bg-black/10'); });
             }
+            // Trigger animation
+            setTimeout(() => cardElement.classList.add('is-visible'), 50);
         }
 
-        // Color functions from previous version
-        function getRandomColor() {
-            const h = Math.floor(Math.random() * 360), s = Math.floor(Math.random() * 20) + 70, l = Math.floor(Math.random() * 20) + 30;
-            return `hsl(${h}, ${s}%, ${l}%)`;
-        }
-        function getTextColor(bgColor) {
-            let color;
-            if (bgColor.startsWith('hsl')) {
-                const hsl = bgColor.substring(4, bgColor.length - 1).replace(/ /g, '').split(',');
-                const h = parseInt(hsl[0]), s = parseInt(hsl[1].replace('%', '')) / 100, l = parseInt(hsl[2].replace('%', '')) / 100;
-                let r, g, b;
-                if (s === 0) { r = g = b = l; } else {
-                    const hue2rgb = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1/6) return p + (q - p) * 6 * t; if (t < 1/2) return q; if (t < 2/3) return p + (q - p) * (2/3 - t) * 6; return p; };
-                    const q = l < 0.5 ? l * (1 + s) : l + s - l * s; const p = 2 * l - q;
-                    r = hue2rgb(p, q, h / 360 + 1/3); g = hue2rgb(p, q, h / 360); b = hue2rgb(p, q, h / 360 - 1/3);
-                }
-                color = { r: r * 255, g: g * 255, b: b * 255 };
-            } else {
-                const hex = bgColor.replace('#', '');
-                color = { r: parseInt(hex.substring(0,2), 16), g: parseInt(hex.substring(2,4), 16), b: parseInt(hex.substring(4,6), 16) };
-            }
-            return (Math.round(((color.r * 299) + (color.g * 587) + (color.b * 114)) / 1000) > 125) ? 'black' : 'white';
-        }
+        // Color functions...
+        function getRandomColor() { const h = Math.floor(Math.random() * 360), s = Math.floor(Math.random() * 20) + 70, l = Math.floor(Math.random() * 20) + 30; return `hsl(${h}, ${s}%, ${l}%)`; }
+        function getTextColor(bgColor) { let color; if (bgColor.startsWith('hsl')) { const hsl = bgColor.substring(4, bgColor.length - 1).replace(/ /g, '').split(','); const h = parseInt(hsl[0]), s = parseInt(hsl[1].replace('%', '')) / 100, l = parseInt(hsl[2].replace('%', '')) / 100; let r, g, b; if (s === 0) { r = g = b = l; } else { const hue2rgb = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1/6) return p + (q - p) * 6 * t; if (t < 1/2) return q; if (t < 2/3) return p + (q - p) * (2/3 - t) * 6; return p; }; const q = l < 0.5 ? l * (1 + s) : l + s - l * s; const p = 2 * l - q; r = hue2rgb(p, q, h / 360 + 1/3); g = hue2rgb(p, q, h / 360); b = hue2rgb(p, q, h / 360 - 1/3); } color = { r: r * 255, g: g * 255, b: b * 255 }; } else { const hex = bgColor.replace('#', ''); color = { r: parseInt(hex.substring(0,2), 16), g: parseInt(hex.substring(2,4), 16), b: parseInt(hex.substring(4,6), 16) }; } return (Math.round(((color.r * 299) + (color.g * 587) + (color.b * 114)) / 1000) > 125) ? 'black' : 'white'; }
 
         document.addEventListener('DOMContentLoaded', loadTimeline);
     </script>
