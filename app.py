@@ -72,7 +72,7 @@ def _get_ai_phase_details(phase_characteristics, top_artists):
     gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}"
     logging.info(f"Requesting AI details for phase: {phase_characteristics['period']}")
     prompt = f"""
-You are a creative music journalist. Based on the following data about a person's music phase, generate two things: a cool, evocative "Daylist-style" name (3-5 words, no numbers), and a short, one-paragraph summary describing the vibe.
+You are a creative music journalist. Based on the following data about a person's music phase, generate two things: a cool, evocative "Daylist-style" name (3-5 words, no numbers), and a short, personal, one-paragraph summary describing the vibe of this era.
 **Phase Data:**
 - **Period:** {phase_characteristics['period']}
 - **Top Genres:** {', '.join(phase_characteristics['top_genres'])}
@@ -242,3 +242,4 @@ def timeline():
 # --- Application Runner ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
