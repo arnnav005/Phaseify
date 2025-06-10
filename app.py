@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from collections import defaultdict
 import json
+import time
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -52,12 +53,13 @@ def _get_season_key(dt):
     if month in (9, 10, 11): return f"Autumn {year}"
     if month == 12: return f"Winter {year}"
 
-def _get_ai_phase_details(phase_characteristics):
+def _get_ai_phase_details(phase_characteristics, top_artists):
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     fallback_response = {"phase_name": f"Your {phase_characteristics['period']} Era", "phase_summary": "A distinct period in your listening journey."}
     if not gemini_api_key: return fallback_response
     
     gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}"
+    logging.info(f"Requesting AI details for phase: {phase_characteristics['period']}")
     prompt = f"""
 You are a creative music journalist. Based on the following data about a person's music phase, generate two things:
 1. A cool, evocative "Daylist-style" name for the phase (3-5 words, no numbers).
@@ -65,7 +67,9 @@ You are a creative music journalist. Based on the following data about a person'
 **Phase Data:**
 - **Period:** {phase_characteristics['period']}
 - **Top Genres:** {', '.join(phase_characteristics['top_genres'])}
+- **Top Artists during this phase:** {', '.join(top_artists)}
 - **Era Vibe:** {'Modern mainstream' if phase_characteristics['avg_release_year'] > 2010 else 'Nostalgic throwback'}
+- **Popularity Vibe:** {'Mainstream hits' if phase_characteristics['avg_popularity'] > 60 else 'Underground discoveries'}
 Return the response ONLY as a valid JSON object with the keys "phase_name" and "phase_summary".
 """
     schema = {"type": "OBJECT", "properties": {"phase_name": {"type": "STRING"}, "phase_summary": {"type": "STRING"}}}
@@ -86,8 +90,8 @@ Return the response ONLY as a valid JSON object with the keys "phase_name" and "
 
 @app.route('/')
 def index():
-    if 'access_token' in session:
-        return redirect(url_for('timeline'))
+    if 'access_token' in session and 'user_id' in session:
+        return redirect(url_for('loading'))
     return render_template('login.html')
 
 @app.route('/login')
@@ -108,7 +112,7 @@ def callback():
         session['user_id'] = user_data.get('id')
         session['display_name'] = user_data.get('display_name', 'music lover')
         
-        return redirect(url_for('timeline'))
+        return redirect(url_for('loading'))
     return jsonify({"error": "Unknown callback error"})
 
 @app.route('/logout')
@@ -116,41 +120,29 @@ def logout():
     session.clear()
     return redirect(url_for('index'))
 
+@app.route('/loading')
+def loading():
+    if 'access_token' not in session: return redirect('/login')
+    return render_template('loading.html')
+
 @app.route('/timeline')
 def timeline():
-    """Renders the timeline page with skeleton loaders."""
-    if 'access_token' not in session: return redirect('/login')
-    display_name = session.get('display_name', 'friend')
-    return render_template('timeline.html', display_name=display_name)
-
-
-# ===================================================================
-# NEW ASYNCHRONOUS ANALYSIS API
-# ===================================================================
-
-@app.route('/api/get_initial_phases')
-def get_initial_phases():
-    """
-    NEW: Fast endpoint that fetches Spotify data and calculates phases WITHOUT AI.
-    """
     access_token = session.get('access_token')
-    if not access_token: return jsonify({"error": "Not authenticated"}), 401
-    
+    if not access_token: return redirect('/login')
+
     try:
-        saved_tracks_items = _get_all_pages('me/tracks?limit=50', access_token)
+        logging.info("Performing full analysis...")
         
-        relevance_scores = defaultdict(int)
-        for item in saved_tracks_items:
-            if item.get('track'): relevance_scores[item['track']['id']] += 1
+        saved_tracks_items = _get_all_pages('me/tracks?limit=50', access_token)
         
         all_tracks_info = {}
         for item in saved_tracks_items:
             track = item.get('track')
-            if not track or not track.get('id') or track['id'] in all_tracks_info: continue
+            if not track or not track.get('id'): continue
             album = track.get('album', {})
             images = album.get('images', [])
-            all_tracks_info[track['id']] = {'name': track.get('name', 'N/A'), 'artist_name': track['artists'][0]['name'] if track.get('artists') else 'N/A', 'popularity': track.get('popularity', 0), 'release_year': int(album.get('release_date', '0').split('-')[0]), 'added_at': item.get('added_at'), 'relevance_score': relevance_scores.get(track['id'], 0), 'cover_url': images[0]['url'] if images else 'https://placehold.co/128x128/121212/FFFFFF?text=?', 'genres': []}
-        
+            all_tracks_info[track['id']] = {'name': track.get('name', 'N/A'), 'artist_name': track['artists'][0]['name'] if track.get('artists') else 'N/A', 'popularity': track.get('popularity', 0), 'release_year': int(album.get('release_date', '0').split('-')[0]), 'added_at': item.get('added_at'), 'cover_url': images[0]['url'] if images else 'https://placehold.co/128x128/121212/FFFFFF?text=?'}
+
         phases = defaultdict(list)
         for track_id, info in all_tracks_info.items():
             if not info.get('added_at'): continue
@@ -167,63 +159,34 @@ def get_initial_phases():
             phase_tracks = phases[key]
             if not phase_tracks: continue
 
-            sorted_tracks = sorted(phase_tracks, key=lambda t: t['relevance_score'], reverse=True)
+            top_artists = list(dict.fromkeys([t['artist_name'] for t in phase_tracks]))[:5]
             
+            valid_years = [t['release_year'] for t in phase_tracks if t.get('release_year', 0) > 0]
+            avg_year = round(sum(valid_years) / len(valid_years)) if valid_years else 'N/A'
+            avg_pop = round(sum(t['popularity'] for t in phase_tracks) / len(phase_tracks)) if phase_tracks else 0
+            
+            # This part can be expanded to fetch genres if needed
+            top_genres = ["Genre 1", "Genre 2"] # Placeholder
+            
+            phase_chars = {"period": key, "top_genres": top_genres, "avg_release_year": avg_year, "avg_popularity": avg_pop}
+            time.sleep(4) 
+            ai_details = _get_ai_phase_details(phase_chars, top_artists)
+
             final_phases_output.append({
-                'phase_period': key,
+                'phase_period': key, 
+                'ai_phase_name': ai_details.get('phase_name', f"Your {key} Era"), 
+                'ai_phase_summary': ai_details.get('phase_summary', "A distinct period..."),
                 'track_count': len(phase_tracks),
-                'sample_tracks': [t['name'] for t in sorted_tracks[:5]],
-                'cover_url': sorted_tracks[0]['cover_url'] if sorted_tracks else 'https://placehold.co/128x128/121212/FFFFFF?text=?'
+                'sample_tracks': [t['name'] for t in phase_tracks[:5]], 
+                'phase_cover_url': phase_tracks[0]['cover_url'] if phase_tracks else 'https://placehold.co/128x128/121212/FFFFFF?text=?'
             })
-            
-        return jsonify(final_phases_output)
-
-    except Exception as e:
-        logging.error(f"Error in get_initial_phases: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/get_ai_details_for_phase', methods=['POST'])
-def get_ai_details_for_phase():
-    """
-    NEW: Endpoint that gets AI details for only ONE phase.
-    """
-    access_token = session.get('access_token')
-    if not access_token: return jsonify({"error": "Not authenticated"}), 401
-    
-    try:
-        phase_tracks = request.json['tracks']
-        phase_period = request.json['period']
         
-        # Calculate stats from the provided track data
-        all_artist_ids = {t['artist_id'] for t in phase_tracks if t.get('artist_id')}
-        genres_map = _get_artist_genres(list(all_artist_ids), access_token)
-        
-        genres_count = defaultdict(int)
-        for track in phase_tracks:
-            if track.get('artist_id') in genres_map:
-                for genre in genres_map[track['artist_id']]:
-                    genres_count[genre] += 1
-                    
-        top_genres = sorted(genres_count, key=genres_count.get, reverse=True)[:5]
-        avg_pop = round(sum(t['popularity'] for t in phase_tracks) / len(phase_tracks)) if phase_tracks else 0
-        valid_years = [t['release_year'] for t in phase_tracks if t.get('release_year', 0) > 0]
-        avg_year = round(sum(valid_years) / len(valid_years)) if valid_years else 'N/A'
+        display_name = session.get('display_name', 'friend')
+        return render_template('timeline.html', phases=final_phases_output, display_name=display_name)
 
-        phase_chars = {"period": phase_period, "top_genres": top_genres, "avg_release_year": avg_year, "avg_popularity": avg_pop}
-        
-        ai_details = _get_ai_phase_details(phase_chars)
-
-        return jsonify({
-            **ai_details,
-            'top_genres': top_genres,
-            'average_popularity': avg_pop,
-            'average_release_year': avg_year
-        })
-    except Exception as e:
-        logging.error(f"Error in get_ai_details_for_phase: {e}")
-        return jsonify({"error": str(e)}), 500
-
+    except requests.exceptions.RequestException as e:
+        logging.error(f"An error occurred during analysis: {e}")
+        return render_template('login.html', error="An error occurred. Your session might have expired. Please log in again.")
 
 # --- Application Runner ---
 if __name__ == '__main__':
